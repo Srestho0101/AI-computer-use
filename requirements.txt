@@ -1,0 +1,10 @@
+# Python dependencies for JARVIS v2.
+#
+# System packages still needed on Arch Linux:
+#   sudo pacman -S ydotool tesseract tesseract-data-eng python-atspi
+
+mistralai>=2.0.3
+mss>=10.2.0
+Pillow>=12.3.0
+evdev>=1.9.3
+i3ipc>=2.2.1
