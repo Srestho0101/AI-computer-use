@@ -1,7 +1,7 @@
 ```
 jarvis-v2/
-├── jarvis.py           # Main agent (the big file above)
-├── test_tools.py       # System compatibility tests
+├── brain.py           # Main agent (the big file above)
+├── test.py       # System compatibility tests
 ├── requirements.txt    # Python dependencies
 └── README.md           # Documentation
 ```
