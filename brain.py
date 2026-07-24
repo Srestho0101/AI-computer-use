@@ -3,8 +3,8 @@
 JARVIS v2 – Robust brain.py with fallbacks and circuit breakers
 """
 
-import os, sys, json, time, subprocess, threading, base64
-from typing import Dict, List, Optional, Any
+import os, sys, json, time, subprocess, threading, base64, re
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from mistralai import Mistral
 
@@ -13,17 +13,77 @@ from mistralai import Mistral
 # ═══════════════════════════════════════════════════════════════════
 
 @dataclass
+class CycleRecord:
+    cycle_number: int
+    actions: List[Dict]
+    fingerprint: str
+    reasoning: str = ""
+    expected_outcome: str = ""
+    result: str = "unknown"
+    pre_focus: Optional[Dict] = None
+    post_focus: Optional[Dict] = None
+    state_changed: bool = False
+    tool_results: List[Dict] = field(default_factory=list)
+    supervisor_directive: str = ""
+
+
+@dataclass
+class NavigationSettleState:
+    pending: bool = False
+    target: str = ""
+    fingerprint: str = ""
+    started_at: float = 0.0
+    completed_at: float = 0.0
+    status: str = "idle"
+    message: str = ""
+
+
+@dataclass
 class AgentState:
     objective: str
     initial_reasoning: str = ""
     action_history: List[Dict] = field(default_factory=list)
     tool_results: List[Dict] = field(default_factory=list)
     turn_count: int = 0
+    cycle_count: int = 0
     consecutive_failures: int = 0
-    consecutive_malformed: int = 0       # ← new counter
+    consecutive_malformed: int = 0
     consecutive_same_tool: int = 0
     last_tool_name: str = ""
     task_phase: str = "planning"
+    cycle_history: List[CycleRecord] = field(default_factory=list)
+    repeated_action_count: int = 0
+    last_action_fingerprint: str = ""
+    last_review_cycle: int = 0
+    latest_supervisor_directive: str = ""
+    supervisor_warning: str = ""
+    navigation: NavigationSettleState = field(default_factory=NavigationSettleState)
+
+
+def normalize_actions(actions: List[Dict]) -> str:
+    normalized = []
+    for action in actions:
+        kind = action.get("type", "")
+        if kind == "type_text":
+            text = re.sub(r"\s+", " ", action.get("text", "").strip().lower())
+            normalized.append({"type": kind, "text": text})
+        elif kind == "key_combo":
+            normalized.append({"type": kind, "keys": action.get("keys", "").strip().lower()})
+        elif kind == "wait":
+            normalized.append({"type": kind, "duration": round(float(action.get("duration", 0)), 1)})
+        else:
+            normalized.append(action)
+    return json.dumps(normalized, sort_keys=True)
+
+
+def is_navigation_batch(actions: List[Dict]) -> Tuple[bool, str]:
+    keys = [a.get("keys", "").lower().strip() for a in actions if a.get("type") == "key_combo"]
+    texts = [a.get("text", "").strip() for a in actions if a.get("type") == "type_text"]
+    has_location_focus = any(k in {"ctrl+l", "ctrl+t"} for k in keys)
+    has_enter = "enter" in keys
+    target = texts[-1] if texts else ""
+    looks_like_url = bool(re.search(r"(^https?://)|([a-z0-9-]+\.[a-z]{2,})", target.lower()))
+    return has_location_focus and has_enter and looks_like_url, target
 
 # ═══════════════════════════════════════════════════════════════════
 # Event Monitors
@@ -421,61 +481,76 @@ class LLMClient:
             print("❌ MISTRAL_API_KEY not set!")
             sys.exit(1)
         self.client = Mistral(api_key=self.api_key)
-        self.model = "mistral-small-latest"
+        self.planner_model = os.environ.get("JARVIS_PLANNER_MODEL", "mistral-large-latest")
+        self.supervisor_model = os.environ.get("JARVIS_SUPERVISOR_MODEL", self.planner_model)
+        self.worker_model = os.environ.get("JARVIS_WORKER_MODEL", "mistral-small-latest")
+        self.min_delay = float(os.environ.get("JARVIS_LLM_DELAY", "1.5"))
         self.last_call = 0
 
     def _wait(self):
         elapsed = time.time() - self.last_call
-        if elapsed < 1.5:
-            time.sleep(1.5 - elapsed)
+        if elapsed < self.min_delay:
+            time.sleep(self.min_delay - elapsed)
         self.last_call = time.time()
 
-    def initial_plan(self, objective):
+    def _complete(self, model, messages, json_mode=False, max_tokens=1000):
         self._wait()
-        try:
-            resp = self.client.chat.complete(
-                model=self.model,
-                messages=[{"role":"user","content": 
-                    f"Task: {objective}\n\n"
-                    "You are an agent on i3 (Linux).\n"
-                    "Create a 4-6 step plan using keyboard shortcuts:\n"
-                    "- Launch apps: Super+d → type name → Enter\n"
-                    "- Firefox: Ctrl+l focuses address bar, type URL, Enter\n"
-                    "- Ctrl+t for new tab\n"
-                    "Be specific. Respond with numbered steps only."}],
-                temperature=0.1, max_tokens=400
-            )
-            return resp.choices[0].message.content
-        except Exception as e:
-            print(f"⚠️ Plan error: {e}")
-            return "1. Open app launcher (Super+d)\n2. Type app name and Enter\n3. Verify window opened\n4. Complete task"
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        return self.client.chat.complete(**kwargs).choices[0].message.content.strip()
 
-    def ask(self, system_prompt):
-        self._wait()
+    def initial_plan(self, objective):
+        try:
+            return self._complete(
+                self.planner_model,
+                [{"role":"user","content":
+                    f"Task: {objective}\n\n"
+                    "You are the planning model for a Linux i3 keyboard-only desktop agent.\n"
+                    "Create a concise 4-6 step plan. Include verification steps and avoid retrying navigation while pages load.\n"
+                    "Launch apps with Super+d, type name, Enter. Firefox navigation uses Ctrl+l, URL, Enter.\n"
+                    "Respond with numbered steps only."}],
+                max_tokens=500,
+            )
+        except Exception as e:
+            print(f"⚠️ Plan error ({self.planner_model}): {e}")
+            return "1. Observe the desktop\n2. Open the needed application\n3. Navigate or enter data once\n4. Wait for loading and verify state\n5. Complete the task"
+
+    def ask_worker(self, system_prompt):
+        return self._ask_json(self.worker_model, system_prompt, fallback={"response_type":"question","question_text":"Repeated worker errors. Please guide me."})
+
+    def ask_supervisor(self, system_prompt):
+        return self._ask_json(self.supervisor_model, system_prompt, fallback={
+            "response_type":"review",
+            "status":"intervention",
+            "summary":"Supervisor review failed.",
+            "directive":"Worker should stop repeating the last action, wait briefly, and verify with a different observation tool."
+        })
+
+    def _ask_json(self, model, system_prompt, fallback):
         for attempt in range(2):
             try:
-                resp = self.client.chat.complete(
-                    model=self.model,
-                    messages=[{"role":"system","content": system_prompt}],
-                    response_format={"type":"json_object"},
-                    temperature=0.0, max_tokens=1000
-                )
-                content = resp.choices[0].message.content.strip()
+                content = self._complete(model, [{"role":"system","content": system_prompt}], json_mode=True, max_tokens=1200)
                 parsed = json.loads(content)
                 if "response_type" not in parsed:
                     raise ValueError("Missing response_type")
                 return parsed
             except json.JSONDecodeError:
-                print(f"⚠️ JSON error, retrying...")
+                print(f"⚠️ JSON error from {model}, retrying...")
                 time.sleep(1)
             except Exception as e:
                 if "429" in str(e):
                     print("⏳ Rate limited, waiting 30s...")
                     time.sleep(30)
                 else:
-                    print(f"⚠️ API error: {e}")
+                    print(f"⚠️ API error from {model}: {e}")
                     time.sleep(2)
-        return {"response_type":"question","question_text":"Repeated errors. Please guide me."}
+        return fallback.copy()
 
 # ═══════════════════════════════════════════════════════════════════
 # System Prompt (stricter)
@@ -484,7 +559,7 @@ class LLMClient:
 PROMPT = """You are JARVIS, controlling i3 on Arch Linux via keyboard injection.
 
 OBJECTIVE: {objective}
-PHASE: {phase} | TURN: {turn}
+PHASE: {phase} | TURN: {turn} | ACTION CYCLE: {cycle}
 
 YOUR PLAN:
 {plan}
@@ -494,6 +569,12 @@ RECENT ACTIONS:
 
 LAST TOOL RESULTS:
 {tool_results}
+
+NAVIGATION/LOADING STATE:
+{navigation_state}
+
+SUPERVISOR DIRECTIVE:
+{supervisor_directive}
 
 AVAILABLE TOOLS (request using tool_request JSON):
 - wm_events(count) : Shows recent window events AND list of ALL open windows with focus.
@@ -529,6 +610,7 @@ CRITICAL RULES:
 2. Firefox navigation: Ctrl+l focuses address bar → type URL → Enter. Ctrl+t for new tab.
 3. ALWAYS verify with wm_events or accessibility_tree after every action batch.
 4. If wm_events already shows what you need, ACT on it. Do NOT request the same tool again.
+4a. After entering a website URL, do NOT immediately enter the same URL again. Pages can still be loading; wait or verify with accessibility_tree/OCR before retrying navigation.
 5. NEVER output a tool_request without a "tool_name" field.
 6. If stuck after 2 attempts, use question response to ask human.
 
@@ -549,210 +631,290 @@ class Jarvis:
         self.executor = ActionExecutor()
         self.tools = ToolHandler(self.kb, self.i3, self.atspi, self.ocr, self.vlm)
         self.llm = LLMClient()
+        self.supervisor_tool_limit = int(os.environ.get("JARVIS_SUPERVISOR_TOOL_LIMIT", "5"))
+        self.review_interval = int(os.environ.get("JARVIS_REVIEW_INTERVAL", "10"))
+        self.repetition_threshold = int(os.environ.get("JARVIS_REPETITION_THRESHOLD", "3"))
+        self.settle_timeout = float(os.environ.get("JARVIS_NAV_SETTLE_TIMEOUT", "6"))
+        self.settle_poll = float(os.environ.get("JARVIS_NAV_SETTLE_POLL", "0.75"))
         self.kb.start()
         self.i3.start()
         time.sleep(0.5)
         print("✅ Ready.\n")
 
+    def reset_session(self, objective):
+        return AgentState(objective=objective)
+
+    def stop(self):
+        self.kb.stop()
+        self.i3.stop()
+
+    def _focus_signature(self):
+        focused = self.i3.get_focused()
+        if not focused:
+            return None
+        return {"name": focused.get("name"), "class": focused.get("class")}
+
+    def _format_history(self, state):
+        hist = ""
+        for i, a in enumerate(state.action_history[-6:]):
+            t = a.get('type','?')
+            r = a.get('reasoning','')[:100]
+            if t == 'action':
+                acts = a.get('actions',[])
+                desc = ', '.join(f"{x.get('type')}:{x.get('keys', x.get('text', x.get('duration','')))}" for x in acts[:3])
+                hist += f"{i+1}. ACTION: {desc}\n   → {r}\n"
+            elif t == 'tool_request':
+                hist += f"{i+1}. TOOL: {a.get('tool_name','?')} - {r}\n"
+            elif t == 'supervisor_review':
+                hist += f"{i+1}. SUPERVISOR: {a.get('status')} - {a.get('directive','')[:100]}\n"
+            elif t == 'question':
+                hist += f"{i+1}. ASKED: {a.get('text','')[:80]}\n"
+            elif t == 'human_response':
+                hist += f"{i+1}. HUMAN: {a.get('text','')[:80]}\n"
+        return hist or "None yet"
+
+    def _format_tools(self, state):
+        return "".join(f"[{r.get('tool','?')}]:\n{str(r.get('data',''))[:600]}\n\n" for r in state.tool_results) or "None yet. Request a tool to gather info."
+
+    def _nav_state_text(self, state):
+        nav = state.navigation
+        if not nav.pending and not nav.message:
+            return "No pending navigation."
+        return f"status={nav.status}; target={nav.target}; message={nav.message}"
+
+    def _worker_prompt(self, state):
+        return PROMPT.format(
+            objective=state.objective,
+            phase=state.task_phase,
+            turn=state.turn_count,
+            cycle=state.cycle_count,
+            plan=state.initial_reasoning,
+            history=self._format_history(state),
+            tool_results=self._format_tools(state),
+            navigation_state=self._nav_state_text(state),
+            supervisor_directive=state.latest_supervisor_directive or state.supervisor_warning or "None",
+        )
+
+    def _settle_navigation(self, state, actions, fingerprint):
+        is_nav, target = is_navigation_batch(actions)
+        if not is_nav:
+            state.navigation.pending = False
+            return None
+        if state.navigation.fingerprint == fingerprint and time.time() - state.navigation.completed_at < self.settle_timeout:
+            state.navigation.message = "Duplicate navigation suppressed: verify loading instead of re-entering the URL."
+            return {"tool":"navigation_settle", "data": state.navigation.message}
+        state.navigation = NavigationSettleState(True, target, fingerprint, time.time(), 0.0, "loading", f"Waiting for {target} to settle")
+        before = self._focus_signature()
+        deadline = time.time() + self.settle_timeout
+        last = before
+        stable_seen = 0
+        while time.time() < deadline:
+            time.sleep(self.settle_poll)
+            current = self._focus_signature()
+            if current and current == last:
+                stable_seen += 1
+                if stable_seen >= 2:
+                    break
+            else:
+                stable_seen = 0
+                last = current
+        state.navigation.pending = False
+        state.navigation.completed_at = time.time()
+        state.navigation.status = "settled" if stable_seen >= 2 else "timeout"
+        state.navigation.message = f"Navigation to {target} {state.navigation.status}; verify page before retrying URL entry."
+        return {"tool":"navigation_settle", "data": state.navigation.message, "before": before, "after": last}
+
+    def _record_cycle(self, state, actions, reasoning, expected, success, pre_focus, settle_result):
+        post_focus = self._focus_signature()
+        fingerprint = normalize_actions(actions)
+        state.cycle_count += 1
+        changed = pre_focus != post_focus or bool(settle_result and settle_result.get("before") != settle_result.get("after"))
+        if fingerprint == state.last_action_fingerprint and not changed:
+            state.repeated_action_count += 1
+        else:
+            state.repeated_action_count = 1
+        state.last_action_fingerprint = fingerprint
+        tools = list(state.tool_results)
+        if settle_result:
+            tools.append(settle_result)
+            state.tool_results = [settle_result]
+        rec = CycleRecord(state.cycle_count, actions, fingerprint, reasoning, expected, "success" if success else "failed", pre_focus, post_focus, changed, tools)
+        state.cycle_history.append(rec)
+        return rec
+
+    def _supervisor_prompt(self, state, reason, records, observations):
+        payload = [{
+            "cycle": r.cycle_number,
+            "fingerprint": r.fingerprint,
+            "actions": r.actions,
+            "result": r.result,
+            "state_changed": r.state_changed,
+            "pre_focus": r.pre_focus,
+            "post_focus": r.post_focus,
+            "reasoning": r.reasoning,
+            "tools": r.tool_results[-2:],
+        } for r in records]
+        return ("You are the large-model supervisor for a keyboard-only Linux desktop agent. "
+                "Review progress, detect loops, and provide concise guidance. You may request observation tools only.\n"
+                f"Objective: {state.objective}\nReason for review: {reason}\nPlan:\n{state.initial_reasoning}\n"
+                f"Navigation state: {self._nav_state_text(state)}\nCycle records JSON:\n{json.dumps(payload, default=str)[:6000]}\n"
+                f"Extra observations JSON:\n{json.dumps(observations, default=str)[:3000]}\n"
+                "Respond as JSON. Either request one tool with response_type=tool_request, tool_name, parameters, reasoning, "
+                "or finish with {\"response_type\":\"review\",\"status\":\"ok|intervention\",\"summary\":\"...\",\"directive\":\"clear instruction for worker\"}.")
+
+    def _run_supervisor_review(self, state, reason):
+        records = state.cycle_history[-10:]
+        observations = []
+        for _ in range(self.supervisor_tool_limit + 1):
+            resp = self.llm.ask_supervisor(self._supervisor_prompt(state, reason, records, observations))
+            if resp.get("response_type") == "tool_request" and len(observations) < self.supervisor_tool_limit:
+                name = resp.get("tool_name") or "wm_events"
+                if name == "get_action_history":
+                    data = json.dumps([r.__dict__ for r in records], default=str)
+                    observations.append({"tool":"action_history", "data": data})
+                else:
+                    resp["tool_name"] = name
+                    observations.append(self.tools.run(resp))
+                continue
+            if resp.get("response_type") == "review":
+                state.latest_supervisor_directive = resp.get("directive", "")
+                state.last_review_cycle = state.cycle_count
+                state.action_history.append({"type":"supervisor_review", "status":resp.get("status"), "reason":reason, "summary":resp.get("summary",""), "directive":state.latest_supervisor_directive})
+                if state.cycle_history:
+                    state.cycle_history[-1].supervisor_directive = state.latest_supervisor_directive
+                print(f"🧭 Supervisor {resp.get('status')}: {resp.get('summary','')[:160]}")
+                if state.latest_supervisor_directive:
+                    print(f"   Directive: {state.latest_supervisor_directive[:220]}")
+                return resp
+            break
+        warning = "Supervisor could not complete review; worker must avoid repeating the last action and verify with a different observation."
+        state.supervisor_warning = warning
+        state.latest_supervisor_directive = warning
+        return {"response_type":"review", "status":"intervention", "summary":"Supervisor unavailable", "directive":warning}
+
+    def _has_repeated_short_pattern(self, state):
+        if len(state.cycle_history) < 4:
+            return False
+        recent = state.cycle_history[-4:]
+        fingerprints = [r.fingerprint for r in recent]
+        no_progress = not any(r.state_changed for r in recent)
+        return no_progress and fingerprints[:2] == fingerprints[2:]
+
+    def _maybe_review(self, state):
+        if state.cycle_count and state.repeated_action_count >= self.repetition_threshold and state.last_review_cycle != state.cycle_count:
+            return self._run_supervisor_review(state, "three repeated action cycles without meaningful progress")
+        if state.cycle_count and self._has_repeated_short_pattern(state) and state.last_review_cycle != state.cycle_count:
+            return self._run_supervisor_review(state, "repeated short action pattern without meaningful progress")
+        if state.cycle_count and state.cycle_count % self.review_interval == 0 and state.last_review_cycle != state.cycle_count:
+            return self._run_supervisor_review(state, f"periodic {self.review_interval}-cycle checkpoint")
+        return None
+
     def run(self, objective):
-        state = AgentState(objective=objective)
+        state = self.reset_session(objective)
         state.initial_reasoning = self.llm.initial_plan(objective)
         print(f"📝 Plan:\n{state.initial_reasoning}\n{'─'*50}\n")
-        
         while True:
             state.turn_count += 1
-            
-            # Build prompt
-            hist = ""
-            for i, a in enumerate(state.action_history[-4:]):
-                t = a.get('type','?')
-                r = a.get('reasoning','')[:100]
-                if t == 'action':
-                    acts = a.get('actions',[])
-                    desc = ', '.join(f"{x['type']}:{list(x.values())[1]}" for x in acts[:3])
-                    hist += f"{i+1}. ACTION: {desc}\n   → {r}\n"
-                elif t == 'tool_request':
-                    hist += f"{i+1}. TOOL: {a.get('tool_name','?')} - {r}\n"
-                elif t == 'question':
-                    hist += f"{i+1}. ASKED: {a.get('text','')[:80]}\n"
-                elif t == 'human_response':
-                    hist += f"{i+1}. HUMAN: {a.get('text','')[:80]}\n"
-            
-            tools = ""
-            for r in state.tool_results:
-                d = r.get('data','')[:600]
-                tools += f"[{r.get('tool','?')}]:\n{d}\n\n"
-            
-            prompt = PROMPT.format(
-                objective=objective,
-                phase=state.task_phase,
-                turn=state.turn_count,
-                plan=state.initial_reasoning,
-                history=hist or "None yet",
-                tool_results=tools or "None yet. Request a tool to gather info."
-            )
-            
-            resp = self.llm.ask(prompt)
+            resp = self.llm.ask_worker(self._worker_prompt(state))
             rtype = resp.get("response_type", "")
-            
-            # ─── Malformed response fallback ───
             if not rtype:
                 state.consecutive_malformed += 1
                 if state.consecutive_malformed >= 3:
-                    print("⚠️ Too many malformed responses. Forcing action: open dmenu.")
-                    resp = {
-                        "response_type": "action",
-                        "actions": [{"type":"key_combo","keys":"super+d"},{"type":"wait","duration":0.3}],
-                        "reasoning": "Circuit breaker: opening dmenu to re‑establish state.",
-                        "expected_outcome": "dmenu appears at top of screen."
-                    }
-                    rtype = "action"
-                    state.consecutive_malformed = 0
+                    resp = {"response_type":"question","question_text":"The worker returned malformed responses repeatedly. What should I do next?"}
+                    rtype = "question"
                 else:
-                    print(f"⚠️ Malformed response (missing response_type). Skipping turn.")
+                    print("⚠️ Malformed response (missing response_type). Skipping turn.")
                     continue
-            
-            # ─── Tool request with missing tool_name fallback ───
             if rtype == "tool_request":
-                name = resp.get("tool_name", "")
-                if not name:
-                    print("⚠️ tool_request missing tool_name, defaulting to wm_events.")
-                    name = "wm_events"
-                    resp["tool_name"] = name
-                
-                # Anti‑loop detection
+                name = resp.get("tool_name") or "wm_events"
+                resp["tool_name"] = name
                 if name == state.last_tool_name:
                     state.consecutive_same_tool += 1
                 else:
                     state.consecutive_same_tool = 1
                 state.last_tool_name = name
-                
                 if state.consecutive_same_tool >= 3:
-                    print(f"⚠️ Same tool '{name}' 3 times. Forcing action: open dmenu.")
-                    resp = {
-                        "response_type": "action",
-                        "actions": [{"type":"key_combo","keys":"super+d"},{"type":"wait","duration":0.3}],
-                        "reasoning": "Breaking tool loop by opening dmenu.",
-                        "expected_outcome": "dmenu should appear."
-                    }
-                    rtype = "action"
+                    state.latest_supervisor_directive = f"You requested {name} repeatedly. Use a different observation or take the next safe action."
                     state.consecutive_same_tool = 0
-                    state.consecutive_malformed = 0
+                print(f"🔧 Turn {state.turn_count}: {name}")
+                if name == "get_action_history":
+                    count = min(resp.get("parameters",{}).get("count",5), 10)
+                    formatted = json.dumps([r.__dict__ for r in state.cycle_history[-count:]], default=str)
+                    state.tool_results = [{"tool":"action_history","data":formatted}]
                 else:
-                    print(f"🔧 Turn {state.turn_count}: {name}")
-                    print(f"   Reason: {resp.get('reasoning','')[:120]}")
-                    
-                    if name == "get_action_history":
-                        count = min(resp.get("parameters",{}).get("count",5), 10)
-                        formatted = "\n".join(
-                            f"{a.get('type','?')}: {a.get('reasoning','')[:100]}"
-                            for a in state.action_history[-count:]
-                        )
-                        state.tool_results = [{"tool":"action_history","data":formatted}]
-                    else:
-                        result = self.tools.run(resp)
-                        state.tool_results = [result]
-                        preview = result['data'][:250]
-                        if len(result['data']) > 250:
-                            preview += "..."
-                        print(f"   Result: {preview}")
-                    
-                    state.action_history.append({
-                        "type":"tool_request",
-                        "tool_name":name,
-                        "reasoning":resp.get("reasoning","")
-                    })
-                    state.consecutive_malformed = 0
-                    continue
-            
-            # ─── Action ───
+                    result = self.tools.run(resp)
+                    state.tool_results = [result]
+                    print(f"   Result: {str(result.get('data',''))[:250]}")
+                state.action_history.append({"type":"tool_request", "tool_name":name, "reasoning":resp.get("reasoning","")})
+                state.consecutive_malformed = 0
+                continue
             if rtype == "action":
-                actions = resp.get("actions", [])
+                actions = resp.get("actions", [])[:5]
                 if not actions:
                     print("⚠️ Action response with no actions")
                     continue
-                
+                fingerprint = normalize_actions(actions)
+                nav, target = is_navigation_batch(actions)
+                if nav and state.navigation.fingerprint == fingerprint and time.time() - state.navigation.completed_at < self.settle_timeout:
+                    msg = "Blocked immediate duplicate navigation; wait/observe because the page may still be loading."
+                    state.tool_results = [{"tool":"navigation_guard", "data":msg}]
+                    state.latest_supervisor_directive = msg
+                    print(f"🛑 {msg}")
+                    continue
                 reasoning = resp.get("reasoning", "")
                 expected = resp.get("expected_outcome", "")
-                
-                print(f"\n⚡ Turn {state.turn_count}: Executing {len(actions)} action(s)")
-                print(f"   Plan: {reasoning[:150]}")
-                print(f"   Expected: {expected[:150]}")
-                
-                for i, a in enumerate(actions):
-                    print(f"   {i+1}. {a['type']}: {list(a.values())[1]}")
-                
+                print(f"\n⚡ Cycle {state.cycle_count + 1}: Executing {len(actions)} action(s)")
+                pre_focus = self._focus_signature()
                 success = self.executor.execute(actions)
-                
-                state.action_history.append({
-                    "type":"action",
-                    "actions":actions,
-                    "reasoning":reasoning,
-                    "expected_outcome":expected,
-                    "result":"success" if success else "failed"
-                })
-                
+                settle = self._settle_navigation(state, actions, fingerprint)
+                state.action_history.append({"type":"action", "actions":actions, "reasoning":reasoning, "expected_outcome":expected, "result":"success" if success else "failed"})
+                self._record_cycle(state, actions, reasoning, expected, success, pre_focus, settle)
                 state.task_phase = "verifying"
-                state.tool_results = []
                 state.consecutive_same_tool = 0
                 state.consecutive_malformed = 0
                 state.consecutive_failures = 0 if success else state.consecutive_failures + 1
+                self._maybe_review(state)
                 continue
-            
-            # ─── Question ───
             if rtype == "question":
                 qtext = resp.get("question_text", "I need help.")
-                print(f"\n{'='*50}")
-                print(f"\a\a\a")
-                print(f"🔔 AGENT NEEDS HELP")
-                print(f"{'='*50}")
-                print(f"\n❓ {qtext}")
-                
+                print(f"\n{'='*50}\n\a\a\a\n🔔 AGENT NEEDS HELP\n{'='*50}\n\n❓ {qtext}")
                 ans = input("\n👉 Your response (or 'exit'): ")
-                
                 if ans.lower() == 'exit':
                     print("🛑 Terminated by user.")
-                    break
-                
+                    return "user_exit"
                 state.action_history.append({"type":"question","text":qtext})
                 state.action_history.append({"type":"human_response","text":ans})
-                state.consecutive_malformed = 0
                 continue
-            
-            # ─── Terminate ───
             if rtype == "terminate":
                 status = resp.get("task_status", "completed")
                 summary = resp.get("summary", "Task finished.")
-                print(f"\n{'='*50}")
-                print(f"{'✅' if status=='completed' else '❌'} MISSION {status.upper()}")
-                print(f"{'='*50}")
-                print(f"\n{summary}")
-                print(f"\n📊 {state.turn_count} turns, {len(state.action_history)} history entries")
-                break
-            
-            # Unknown response type
+                print(f"\n{'='*50}\n{'✅' if status=='completed' else '❌'} MISSION {status.upper()}\n{'='*50}\n\n{summary}")
+                print(f"\n📊 {state.turn_count} turns, {state.cycle_count} action cycles")
+                return status
             state.consecutive_malformed += 1
-            if state.consecutive_malformed >= 3:
-                print("⚠️ Too many unknown response types. Forcing question to human.")
-                resp = {"response_type":"question","question_text":"I keep getting confused. What should I do next?"}
-                state.consecutive_malformed = 0
-                continue
             print(f"⚠️ Unknown response_type '{rtype}'. Will retry.")
-            continue
-        
-        self.kb.stop()
-        self.i3.stop()
-        print("\n👋 JARVIS shutdown complete.")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        obj = " ".join(sys.argv[1:])
-    else:
-        print("\n🤖 JARVIS v2 - Autonomous Desktop Agent\n")
-        obj = input("What should JARVIS do?\n👉 ").strip()
-    
-    if not obj:
-        print("❌ No objective provided.")
-        sys.exit(1)
-    
-    Jarvis().run(obj)
+    jarvis = Jarvis()
+    try:
+        if len(sys.argv) > 1:
+            obj = " ".join(sys.argv[1:]).strip()
+            if not obj:
+                print("❌ No objective provided.")
+                sys.exit(1)
+            jarvis.run(obj)
+        else:
+            print("\n🤖 JARVIS v2 - Autonomous Desktop Agent")
+            print("Press Ctrl+C to exit. Completed missions return here.\n")
+            while True:
+                obj = input("What should JARVIS do?\n👉 ").strip()
+                if not obj:
+                    print("❌ No objective provided.")
+                    continue
+                jarvis.run(obj)
+                print("\n↩️ Ready for the next objective.\n")
+    except KeyboardInterrupt:
+        print("\n🛑 Ctrl+C received. Shutting down monitors.")
+    finally:
+        jarvis.stop()
+        print("👋 JARVIS shutdown complete.")
