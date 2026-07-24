@@ -2,7 +2,7 @@
 
 **Status:** Active Development
 **Environment:** Arch Linux, i3 Window Manager (X11)
-**LLM Backend:** Mistral API (`mistral-small-latest` for reasoning, `pixtral-12b` for vision)
+**LLM Backend:** Mistral API (`mistral-large-latest` for planning/supervision, `mistral-small-latest` for worker actions, `pixtral-12b` for vision)
 
 An autonomous desktop agent that controls a Linux machine through structured observation and keyboard-level input injection. Rather than treating the screen as its only source of truth, the agent builds a multi-layered understanding of system state -- combining window manager events, accessibility trees, optical character recognition, and visual language models only when necessary. Designed for low-spec hardware, it offloads all cognitive processing to the cloud while keeping local resource usage minimal.
 
@@ -48,7 +48,7 @@ Malformed responses from the language model presented another challenge. Despite
 
 The most subtle failure was the action loop: the agent would successfully type a URL and press Enter, but the window title events arrived out of order or showed multiple states, confusing the LLM into retyping the same URL repeatedly. A fingerprint-based detector now compares the current action batch against the previous two and halts with a human question if an identical sequence appears three times consecutively.
 
-The choice of language model also evolved. The original architecture used `pixtral-12b` for everything, but the free tier's four requests per minute made multi-step tasks impractical. Switching to `mistral-small-latest` for reasoning (50 requests per minute) while reserving `pixtral-12b` for the visual screenshot tool only transformed the agent's responsiveness. A 1.5-second inter-request delay now provides comfortable headroom under the rate limit.
+The choice of language model also evolved. The original architecture used `pixtral-12b` for everything, but the free tier's four requests per minute made multi-step tasks impractical. The current dual-model design uses `mistral-large-latest` only for the initial plan, loop recovery, and ten-cycle checkpoints, while `mistral-small-latest` performs high-frequency worker decisions. `pixtral-12b` remains reserved for the visual screenshot tool. A shared configurable inter-request delay keeps the free-tier quota protected.
 
 ---
 
@@ -62,11 +62,15 @@ The choice of language model also evolved. The original architecture used `pixtr
 
 **Verification Gates.** Every action batch must be confirmed by an observation tool before the next batch proceeds. The agent cannot assume that pressing Ctrl+N actually created a new file; it must verify through window title changes, accessibility tree updates, or OCR.
 
-**Circuit Breakers and Self-Recovery.** Three independent detectors monitor for pathological behavior: same-tool loops (three identical tool requests trigger a forced state change), malformed response loops (three invalid responses trigger a dmenu open), and action repetition loops (three identical action batches trigger a human question).
+**Circuit Breakers and Self-Recovery.** The controller tracks completed action cycles instead of raw LLM turns. Three repeated normalized action batches without meaningful focus/title progress trigger a `mistral-large-latest` supervisor review, and every ten action cycles the supervisor reviews the previous ten cycle records. Same-tool and malformed-response guards remain recoverable, but the preferred recovery path is a structured directive injected into the worker prompt.
 
-**Strategic Planning and Memory.** Before execution begins, the agent generates and records a high-level plan. This plan, the last four actions, and any tool results from the current verification cycle are included in every prompt, providing the LLM with persistent context without overwhelming the token budget.
+**Strategic Planning and Memory.** Before execution begins, the large planner generates and records a high-level plan. Worker prompts include recent actions, current verification results, navigation/loading state, and the latest supervisor directive. Structured cycle records retain action fingerprints, tool observations, state changes, and supervisor guidance for later reviews.
 
-**Rate-Limit Awareness.** API calls respect the free-tier limits of the chosen model, with the expensive vision model protected by a mandatory 12-second cooldown and the reasoning model governed by a 1.5-second inter-request delay.
+**Rate-Limit Awareness.** API calls respect free-tier constraints: the small worker handles most turns, large-model reviews are sparse, supervisor observation calls are capped at five, and the expensive vision model is protected by a mandatory 12-second cooldown.
+
+**Navigation Settle Gate.** URL-entry batches are recognized deterministically (`Ctrl+l` or `Ctrl+t`, typed URL, `Enter`). After such a batch, the controller waits for a bounded stabilization period and records the navigation state. Immediate duplicate URL entry is blocked so slow-loading sites such as YouTube are verified instead of reloaded in a loop.
+
+**Persistent CLI Sessions.** In interactive mode, a `terminate` response ends only the current objective. The process returns to the objective prompt with fresh per-session state, while monitors and API clients remain initialized. `Ctrl+C` stops monitors and exits cleanly.
 
 ---
 
@@ -118,7 +122,7 @@ Or more complex tasks:
 Open Firefox, navigate to YouTube, search for "3 blue 1 brown", and play the latest video
 ```
 
-The agent will generate a strategic plan, then begin its observe-decide-act-verify loop. It will print each tool request, action batch, and verification result to the terminal. If it encounters a situation it cannot resolve, it will ring the terminal bell and ask for human guidance.
+The agent will generate a strategic plan with the large model, then begin its worker observe-decide-act-verify loop. It will print each tool request, action batch, and verification result to the terminal. If it encounters a situation it cannot resolve, it will ring the terminal bell and ask for human guidance.
 
 ---
 
@@ -128,13 +132,13 @@ The agent will generate a strategic plan, then begin its observe-decide-act-veri
 User Objective
       |
       v
-Initial Strategic Plan (LLM)
+Initial Strategic Plan (mistral-large-latest)
       |
       v
 +-----+------+     +-------------------+
 | LLM Client |<--->| Agent Controller  |
-| (mistral-  |     | (state machine,   |
-|  small)    |     |  circuit breakers)|
+| worker +   |     | (cycle tracking,  |
+| supervisor) |     |  settle/reviews)  |
 +------------+     +--------+----------+
                             |
             +---------------+---------------+
