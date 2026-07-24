@@ -1,107 +1,208 @@
-# 🤖 JARVIS: Cloud Vision Desktop Agent (Mistral Edition)
+# JARVIS: An Event-Driven Autonomous Desktop Agent
 
-> **Status:** 🚀 Active
-> **Environment:** Arch Linux, GNOME (Wayland/X11)
-> **LLM Backend:** Mistral `pixtral-12b` (Cloud API)
+**Status:** Active Development
+**Environment:** Arch Linux, i3 Window Manager (X11)
+**LLM Backend:** Mistral API (`mistral-small-latest` for reasoning, `pixtral-12b` for vision)
 
-An autonomous, multimodal AI desktop agent engineered specifically for low-spec hardware (e.g., 4GB RAM, older dual-core CPUs). Instead of relying on heavy local Vision-Language Models (VLMs) that exhaust system swap space, this architecture offloads cognitive processing to the Mistral cloud. It captures lossless desktop frames, reasons about the UI state, and executes keyboard-driven navigation via kernel-level input injection.
-
----
-
-## ✨ Core Features
-
-* **Zero-Disk Perception:** Uses `mss` to capture native 1080p display frames directly into system RAM as raw PNG bytes, bypassing SSD wear and ensuring the AI can read small terminal fonts.
-* **Keyboard-Only Wayland Navigation:** Bypasses Wayland's absolute mouse-coordinate scaling issues by forcing the AI to navigate GNOME entirely via standard keyboard shortcuts (Super, Enter, Ctrl+N).
-* **Kernel-Level Input Injection:** Translates string-based AI commands (e.g., `super`, `ctrl+n`) into raw hardware scancodes executed via the `ydotool` daemon.
-* **Built-in API Rate Shielding:** Hardcoded 12-second execution throttling prevents exhausting the free-tier Mistral API limits (5 requests/minute).
-* **Auditory Human-in-the-Loop:** Automatically pauses the autonomous loop and fires a terminal bell (`\a`) when the AI requires human permission, clarification, or password entry.
-* **Sandboxed Execution:** Designed to be run in a dedicated, isolated `ai-worker` Linux user account to completely protect personal data and host system integrity.
+An autonomous desktop agent that controls a Linux machine through structured observation and keyboard-level input injection. Rather than treating the screen as its only source of truth, the agent builds a multi-layered understanding of system state -- combining window manager events, accessibility trees, optical character recognition, and visual language models only when necessary. Designed for low-spec hardware, it offloads all cognitive processing to the cloud while keeping local resource usage minimal.
 
 ---
 
-## 🛠️ Installation & Setup
+## Evolution of the Project
 
-### 1. System Dependencies (Arch Linux)
+What began as a simple screen-capture-and-act loop has evolved through three distinct architectural phases, each driven by hard lessons learned at the boundary between AI reasoning and real desktop environments.
 
-Install the required kernel-level input injector:
+### Phase One: The Blind Visionary
+
+The original concept was straightforward. Capture a screenshot, send it to a vision-language model, ask what to do next, and inject the resulting keystrokes. Mistral's `pixtral-12b` served as both eyes and brain, receiving a base64-encoded PNG alongside a system prompt and returning JSON action commands.
+
+This approach worked -- barely. On a machine with 4GB of RAM, running any local model caused the system to spiral into swap, pushing frame processing times past 200 seconds. Offloading to the cloud solved the memory crisis, but created new ones. The free tier's five requests per minute meant a mandatory 12-second gap between every action. Opening a single application required three separate API calls: one to press Super, one to type the app name, one to press Enter. That was 36 seconds just to launch a program. Any mistake meant starting over.
+
+Worse, the agent was effectively blind between screenshots. It would press a shortcut, wait for the next capture cycle, and hope the right window had appeared. When it hadn't, the agent often hallucinated success and began typing Python code into a Bash terminal, or into nothing at all.
+
+### Phase Two: The Event-Driven Architecture
+
+The breakthrough came from recognizing that the screen is the slowest and most expensive source of truth about a computer's state. Linux already exposes rich structured data about what's happening: the kernel logs every keystroke through `/dev/input`, the i3 window manager broadcasts every window creation, focus change, and title update through its IPC socket, and the AT-SPI2 accessibility protocol exposes the internal structure of most GUI applications as a traversable tree of elements with names, roles, and text content.
+
+The rewrite replaced the single screenshot loop with five on-demand observation tools, any of which the LLM could request before committing to an action:
+
+- **input_events**: Returns the last N keyboard events captured at the kernel level, confirming what actually reached the system.
+- **wm_events**: Shows recent window manager events alongside a complete list of currently open windows with focus indicators, making application state immediately visible.
+- **accessibility_tree**: Reads the UI element tree of any window, revealing buttons, text fields, labels, and their contents without touching a pixel.
+- **ocr_screenshot**: Extracts all visible text from the screen using Tesseract, providing a fast textual readout of dialogs, error messages, and web page content.
+- **visual_screenshot**: The original vision model call, now reserved as a last resort for understanding complex visual layouts or applications that don't expose accessibility data.
+
+The LLM now operates as an orchestrator. It begins by generating a strategic plan, then enters a tight observe-decide-act-verify loop. After each action batch -- up to five keystroke injections that can be executed atomically -- it requests a verification tool. If the accessibility tree confirms that a save dialog appeared and shows the filename field, there is no need to waste a vision API call on a screenshot. If `wm_events` reports that a Firefox window opened and is now focused, the agent can proceed directly to typing a URL.
+
+This reduced vision model calls by roughly 80% and made the agent feel responsive for the first time. Actions that previously took 36-48 seconds now complete in 2-5 seconds.
+
+The environment also shifted. GNOME on Wayland had been a constant source of friction: animations that confused the vision model, mouse coordinate scaling that broke cursor injection, and resource consumption that strained limited RAM. The move to i3 on X11 provided a deterministic, keyboard-native desktop where every window fills its workspace predictably, no animations interfere with screenshots, and the window manager itself exposes programmatic state through IPC.
+
+### Phase Three: Resilience Engineering
+
+The event-driven architecture solved the core efficiency problem but revealed new failure modes that only emerge when an AI agent runs unsupervised for extended periods.
+
+The most persistent was the tool-request loop: the LLM would request `wm_events`, receive a window list showing no change, and request `wm_events` again -- expecting different results despite identical inputs. This could burn through a dozen API calls with no progress. The fix was a same-tool detector that forces an action (opening dmenu) after three consecutive identical tool requests, jolting the system into a new state.
+
+Malformed responses from the language model presented another challenge. Despite explicit JSON schema instructions, the model occasionally omitted required fields like `tool_name` from a tool request. Rather than crash, the agent now defaults to `wm_events` when fields are missing and increments a malformed response counter. After three malformed responses, it forces a circuit-breaker action.
+
+The most subtle failure was the action loop: the agent would successfully type a URL and press Enter, but the window title events arrived out of order or showed multiple states, confusing the LLM into retyping the same URL repeatedly. A fingerprint-based detector now compares the current action batch against the previous two and halts with a human question if an identical sequence appears three times consecutively.
+
+The choice of language model also evolved. The original architecture used `pixtral-12b` for everything, but the free tier's four requests per minute made multi-step tasks impractical. Switching to `mistral-small-latest` for reasoning (50 requests per minute) while reserving `pixtral-12b` for the visual screenshot tool only transformed the agent's responsiveness. A 1.5-second inter-request delay now provides comfortable headroom under the rate limit.
+
+---
+
+## Core Features
+
+**Multi-Layer State Observation.** The agent builds its understanding of the desktop from four independent data sources -- kernel input events, window manager IPC, accessibility trees, and screen capture -- requesting only the layers it needs for the current decision.
+
+**On-Demand Tool Architecture.** Rather than streaming raw event logs, the LLM explicitly requests specific tools with parameters, receiving precisely the context it needs. This keeps prompts lean and reasoning focused.
+
+**Keyboard-Level Control.** All actions are translated to raw scancodes and injected through the `ydotool` daemon at the kernel level, making them indistinguishable from physical keypresses. Mouse movement is deliberately excluded, forcing all navigation through keyboard shortcuts for reliability.
+
+**Verification Gates.** Every action batch must be confirmed by an observation tool before the next batch proceeds. The agent cannot assume that pressing Ctrl+N actually created a new file; it must verify through window title changes, accessibility tree updates, or OCR.
+
+**Circuit Breakers and Self-Recovery.** Three independent detectors monitor for pathological behavior: same-tool loops (three identical tool requests trigger a forced state change), malformed response loops (three invalid responses trigger a dmenu open), and action repetition loops (three identical action batches trigger a human question).
+
+**Strategic Planning and Memory.** Before execution begins, the agent generates and records a high-level plan. This plan, the last four actions, and any tool results from the current verification cycle are included in every prompt, providing the LLM with persistent context without overwhelming the token budget.
+
+**Rate-Limit Awareness.** API calls respect the free-tier limits of the chosen model, with the expensive vision model protected by a mandatory 12-second cooldown and the reasoning model governed by a 1.5-second inter-request delay.
+
+---
+
+## Installation and Setup
+
+### System Dependencies (Arch Linux)
 
 ```bash
-sudo pacman -S ydotool
-
-```
-
-Enable the system daemon and set the global socket path for your user:
-
-```bash
+sudo pacman -S ydotool tesseract tesseract-data-eng python-evdev
 sudo systemctl enable --now ydotoold
 export YDOTOOL_SOCKET=/run/ydotoold.socket
-
-```
-
-*(Note: Add `export YDOTOOL_SOCKET=/run/ydotoold.socket` to your `~/.bashrc` to make it persistent).*
-
-Ensure your user is in the `input` group:
-
-```bash
 sudo usermod -aG input $USER
-
 ```
 
-### 2. The Security Sandbox (Highly Recommended)
+Add the socket export to `~/.bashrc` for persistence.
 
-To prevent the agent from accidentally modifying your personal files if it hallucinates, create a dedicated AI worker account:
-
-```bash
-sudo useradd -m -G video,input ai-worker
-sudo passwd ai-worker
-
-```
-
-Log into this user on a separate TTY (e.g., `Ctrl + Alt + F3`) and start a fresh GNOME session to run the script.
-
-### 3. Python Environment
-
-Create a virtual environment and install the required packages:
+### Python Environment
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install mss mistralai
-
+pip install mistralai mss Pillow i3ipc pyatspi
 ```
+
+### Display Manager
+
+The agent requires the i3 window manager. Install with `sudo pacman -S i3` and ensure it is running before starting the agent. A minimal i3 configuration is recommended: disable window decorations, gaps, and the status bar to reduce visual noise that can confuse the vision model when it is called.
 
 ---
 
-## 🎮 How to Use
+## Usage
 
-1. Export your free Mistral API key:
+Export your Mistral API key and run the agent:
+
 ```bash
 export MISTRAL_API_KEY="your_api_key_here"
-
+python brain.py
 ```
 
-
-2. Run the agent loop:
-```bash
-python agent_cloud_loop.py
+When prompted, provide a natural language objective. For example:
 
 ```
+Open Firefox and go to github.com
+```
 
+Or more complex tasks:
 
-3. When prompted, provide a natural language objective (e.g., *"Open VS Code, create a new python file, and write a hello world script"*).
-4. Switch to your target workspace. The agent will begin its capture-analyze-execute loop.
+```
+Open Firefox, navigate to YouTube, search for "3 blue 1 brown", and play the latest video
+```
+
+The agent will generate a strategic plan, then begin its observe-decide-act-verify loop. It will print each tool request, action batch, and verification result to the terminal. If it encounters a situation it cannot resolve, it will ring the terminal bell and ask for human guidance.
 
 ---
 
-## 🛑 Challenges Faced & Engineering Solutions
+## Architecture
 
-Building an agentic loop on a 4GB RAM machine navigating a Wayland desktop presented severe physical and software roadblocks. Here is how they were engineered away:
+```
+User Objective
+      |
+      v
+Initial Strategic Plan (LLM)
+      |
+      v
++-----+------+     +-------------------+
+| LLM Client |<--->| Agent Controller  |
+| (mistral-  |     | (state machine,   |
+|  small)    |     |  circuit breakers)|
++------------+     +--------+----------+
+                            |
+            +---------------+---------------+
+            |               |               |
+    +-------v------+ +-----v------+ +------v-------+
+    | Tool Handler | | Action     | | Event        |
+    |              | | Executor   | | Monitors     |
+    | wm_events    | | (ydotool)  | | /dev/input   |
+    | input_events | |            | | i3 IPC       |
+    | access_tree  | | key_combo  | | (background  |
+    | ocr_screen   | | type_text  | |  threads)    |
+    | visual_screen| | wait       | |              |
+    +--------------+ +------------+ +--------------+
+```
 
-| The Challenge | The Root Cause | The Engineered Solution |
-| --- | --- | --- |
-| **The RAM Death Spiral** | Local VLMs (like Moondream) or LLMs (like Qwen) consumed all 4GB of physical memory, triggering a swap-space loop that pushed execution times past 200 seconds per frame. | **Cloud Offloading:** Migrated the intelligence layer to Mistral's `pixtral-12b` API. This freed up 100% of local RAM, reducing loop times to ~1-3 seconds plus network latency. |
-| **"Black Screen" Blindness** | Initial optimizations heavily compressed the screenshots into low-quality JPEGs to save API token costs, destroying UI contrast and rendering terminal text unreadable to the AI. | **Lossless High-Res Capture:** Removed OpenCV compression entirely. Switched the `mss` pipeline to capture crisp, uncompressed base64 PNGs directly from RAM. |
-| **Broken Mouse Injection** | Wayland's display scaling misinterpreted `ydotool` absolute $X,Y$ mouse coordinates, violently throwing the cursor into GNOME's "Hot Corner" and triggering unintended menus. | **Keyboard-Only Navigation:** Removed mouse execution entirely. Rewrote the system prompt to force the AI to use keyboard shortcuts (Super $\rightarrow$ Type App Name $\rightarrow$ Enter). |
-| **Silent `ydotool` Failures** | The `ydotool` client ignored standard string keys (like `super` or `ctrl+n`), resulting in silent command drops where nothing happened on screen. | **Raw Scancode Translator:** Built a hardcoded Python dictionary that intercepts AI shortcut strings and translates them into raw kernel down/up scancodes (e.g., `125:1 125:0`). |
-| **Visual Hallucination Loops** | The AI would execute a shortcut, assume the app opened instantly, and begin blindly typing code into the wrong window (e.g., typing Python into a Bash terminal). | **Strict Verification Prompts:** Updated the system prompt with explicit GNOME behavioral rules. Forced the AI to visually verify that an application's UI had successfully rendered on the screen *before* interacting with it. |
-| **API Rate Limit Bans** | The Mistral Free Tier limits requests to 1 per second and a maximum of 5 per minute. | **Algorithmic Throttling:** Programmed a mandatory 12-second sleep delta into the main loop to dynamically pad execution times, guaranteeing the rate limit is never breached. |
+---
+
+## Tools Reference
+
+| Tool | Parameters | Description |
+|------|------------|-------------|
+| `wm_events` | `count` (1-10) | Recent window events and complete window list with focus indicators. After page loads, shows Firefox current page title. |
+| `input_events` | `count` (1-10) | Recent keyboard events captured at kernel level. |
+| `accessibility_tree` | `target` ("focused" or class name), `depth` (1-3) | Structured UI element tree with names, roles, and text content. |
+| `ocr_screenshot` | none | Screen capture processed through Tesseract OCR, returning all visible text. |
+| `visual_screenshot` | `query` (string) | Full screenshot analyzed by `pixtral-12b` vision model. The most expensive tool, reserved for situations where other tools are insufficient. |
+| `get_action_history` | `count` | Returns earlier actions beyond the default four included in each prompt. |
+
+---
+
+## Response Types
+
+The LLM communicates through structured JSON using four response types:
+
+**tool_request**: Requests one of the six observation tools with specific parameters and a reasoning string explaining why the information is needed.
+
+**action**: Specifies a batch of up to five actions to execute, along with the reasoning and expected outcome. Valid action types are `key_combo` (keyboard shortcuts), `type_text` (string input), and `wait` (pause in seconds, maximum 2.0).
+
+**question**: Halts the autonomous loop, rings the terminal bell, and presents a question to the human operator. The operator's response is fed back into the next prompt.
+
+**terminate**: Ends the mission with a summary and status (`completed`, `failed`, or `blocked`).
+
+---
+
+## Key Design Decisions
+
+**Why not continue with GNOME on Wayland?** GNOME's animations, dynamic activities overview, and translucent overlays created visual ambiguity that forced excessive vision model calls. i3's deterministic tiling, absence of animations, and IPC interface provide both cleaner screenshots for the vision model and structured state data that often eliminates the need for screenshots entirely.
+
+**Why keyboard-only navigation?** Mouse coordinate injection proved unreliable across display configurations and Wayland's scaling. More fundamentally, keyboard navigation is inherently deterministic: Ctrl+L always focuses the address bar in Firefox, regardless of screen resolution or window position.
+
+**Why five tools instead of streaming events?** Continuous event streams would overwhelm the LLM's context window with noise. On-demand tools let the agent request exactly what it needs when it needs it, keeping prompts focused and reasoning clear.
+
+**Why circuit breakers instead of trying to perfect the prompts?** Language models are inherently probabilistic and will occasionally produce unexpected output. Prompt engineering can reduce but not eliminate these failures. Circuit breakers provide a safety net that catches pathological loops regardless of their cause.
+
+---
+
+## Limitations and Future Work
+
+The accessibility tree tool depends on application support for AT-SPI2, which varies. Firefox and most GTK applications expose rich trees, while some Electron applications and games provide minimal or no accessibility data.
+
+YouTube and similar dynamic web applications present a challenge: their accessibility trees can be deep and complex, and the page structure changes as content loads. The agent sometimes needs guidance to locate specific elements like search boxes or video thumbnails.
+
+The current implementation uses only keyboard input. Future versions may reintroduce mouse control for applications where keyboard navigation is insufficient, using i3's deterministic window positioning to calculate reliable click coordinates.
+
+Local model support is a natural next step. A small local model handling verification decisions (confirming that a window opened, checking if text was entered) could eliminate the 1.5-second inter-request delay entirely, while the cloud model handles complex reasoning and planning.
+
+---
+
+## License
+
+MIT
