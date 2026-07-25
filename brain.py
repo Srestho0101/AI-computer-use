@@ -1,92 +1,34 @@
 #!/usr/bin/env python3
 """
-JARVIS v2 – Robust brain.py with fallbacks and circuit breakers
+JARVIS v3.1 – Workspace-aware, power-user shortcuts, verified goal termination.
 """
 
-import os, sys, json, time, subprocess, threading, base64, re
+import os, sys, json, time, subprocess, threading, re
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
-from mistralai import Mistral
+from mistralai.client import Mistral
 
 # ═══════════════════════════════════════════════════════════════════
-# Data Structures
+# Data structures
 # ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class SemanticAction:
+    name: str
+    parameters: Dict[str, Any] = field(default_factory=dict)
+    reasoning: str = ""
 
 @dataclass
 class CycleRecord:
     cycle_number: int
-    actions: List[Dict]
-    fingerprint: str
-    reasoning: str = ""
-    expected_outcome: str = ""
-    result: str = "unknown"
-    pre_focus: Optional[Dict] = None
-    post_focus: Optional[Dict] = None
-    state_changed: bool = False
-    tool_results: List[Dict] = field(default_factory=list)
-    supervisor_directive: str = ""
-
-
-@dataclass
-class NavigationSettleState:
-    pending: bool = False
-    target: str = ""
-    fingerprint: str = ""
-    started_at: float = 0.0
-    completed_at: float = 0.0
-    status: str = "idle"
-    message: str = ""
-
-
-@dataclass
-class AgentState:
-    objective: str
-    initial_reasoning: str = ""
-    action_history: List[Dict] = field(default_factory=list)
-    tool_results: List[Dict] = field(default_factory=list)
-    turn_count: int = 0
-    cycle_count: int = 0
-    consecutive_failures: int = 0
-    consecutive_malformed: int = 0
-    consecutive_same_tool: int = 0
-    last_tool_name: str = ""
-    task_phase: str = "planning"
-    cycle_history: List[CycleRecord] = field(default_factory=list)
-    repeated_action_count: int = 0
-    last_action_fingerprint: str = ""
-    last_review_cycle: int = 0
-    latest_supervisor_directive: str = ""
-    supervisor_warning: str = ""
-    navigation: NavigationSettleState = field(default_factory=NavigationSettleState)
-
-
-def normalize_actions(actions: List[Dict]) -> str:
-    normalized = []
-    for action in actions:
-        kind = action.get("type", "")
-        if kind == "type_text":
-            text = re.sub(r"\s+", " ", action.get("text", "").strip().lower())
-            normalized.append({"type": kind, "text": text})
-        elif kind == "key_combo":
-            normalized.append({"type": kind, "keys": action.get("keys", "").strip().lower()})
-        elif kind == "wait":
-            normalized.append({"type": kind, "duration": round(float(action.get("duration", 0)), 1)})
-        else:
-            normalized.append(action)
-    return json.dumps(normalized, sort_keys=True)
-
-
-def is_navigation_batch(actions: List[Dict]) -> Tuple[bool, str]:
-    keys = [a.get("keys", "").lower().strip() for a in actions if a.get("type") == "key_combo"]
-    texts = [a.get("text", "").strip() for a in actions if a.get("type") == "type_text"]
-    has_location_focus = any(k in {"ctrl+l", "ctrl+t"} for k in keys)
-    has_enter = "enter" in keys
-    target = texts[-1] if texts else ""
-    looks_like_url = bool(re.search(r"(^https?://)|([a-z0-9-]+\.[a-z]{2,})", target.lower()))
-    return has_location_focus and has_enter and looks_like_url, target
+    snapshot_before: Dict
+    action: SemanticAction
+    success: bool
+    snapshot_after: Dict
+    state_changed: bool
 
 # ═══════════════════════════════════════════════════════════════════
-# Event Monitors
+# Keyboard Monitor
 # ═══════════════════════════════════════════════════════════════════
 
 class KeyboardMonitor:
@@ -144,6 +86,10 @@ class KeyboardMonitor:
         with self.lock:
             events = self.events[-count:] if self.events else []
         return [e for e in events if e["event_type"] == "press"]
+
+# ═══════════════════════════════════════════════════════════════════
+# i3 Monitor (full implementation)
+# ═══════════════════════════════════════════════════════════════════
 
 class I3Monitor:
     def __init__(self, max_events=200):
@@ -214,10 +160,11 @@ class I3Monitor:
             tree = self.i3.get_tree()
             windows = []
             for leaf in tree.leaves():
+                ws = leaf.workspace().name if leaf.workspace() else None
                 windows.append({
                     "name": leaf.name,
                     "class": leaf.window_class,
-                    "workspace": leaf.workspace().name if leaf.workspace() else None,
+                    "workspace": ws,
                     "focused": leaf.focused
                 })
             return windows
@@ -230,13 +177,14 @@ class I3Monitor:
         try:
             focused = self.i3.get_tree().find_focused()
             if focused:
-                return {"name": focused.name, "class": focused.window_class}
+                ws = focused.workspace().name if focused.workspace() else None
+                return {"name": focused.name, "class": focused.window_class, "workspace": ws}
         except:
             pass
         return None
 
 # ═══════════════════════════════════════════════════════════════════
-# Tools
+# Accessibility Tree (with get_focused_element_info)
 # ═══════════════════════════════════════════════════════════════════
 
 class AccessibilityTree:
@@ -251,25 +199,24 @@ class AccessibilityTree:
 
     def get_tree(self, target="focused", depth=2):
         if not self.available:
-            return "AT-SPI2 not available."
+            return ""
         try:
             desktop = self.pyatspi.Registry.getDesktop(0)
             lines = []
             for app in desktop:
                 if not app: continue
-                app_name = app.name or "Unknown"
                 for window in app:
                     if not window: continue
                     if target == "focused" and not window.getState().contains(self.pyatspi.STATE_FOCUSED):
                         continue
-                    if target.lower() not in window.name.lower() and target.lower() not in app_name.lower():
+                    if target.lower() not in window.name.lower() and target.lower() not in (app.name or "").lower():
                         continue
-                    lines.append(f"App: {app_name} | Window: {window.name} ({window.getRoleName()})")
+                    lines.append(f"Window: {window.name} ({window.getRoleName()})")
                     if depth >= 2:
                         self._walk(window, lines, 0, depth, "  ")
-            return "\n".join(lines) if lines else f"No matching window for '{target}'."
-        except Exception as e:
-            return f"Error: {e}"
+            return "\n".join(lines) if lines else ""
+        except Exception:
+            return ""
 
     def _walk(self, el, lines, depth, max_depth, indent):
         if depth >= max_depth: return
@@ -292,6 +239,53 @@ class AccessibilityTree:
         except:
             pass
 
+    def get_focused_element_info(self):
+        """Extract key UI elements from focused window: URL bar, search fields."""
+        if not self.available:
+            return {}
+        try:
+            desktop = self.pyatspi.Registry.getDesktop(0)
+            for app in desktop:
+                if not app: continue
+                for window in app:
+                    if not window: continue
+                    if window.getState().contains(self.pyatspi.STATE_FOCUSED):
+                        info = {}
+                        self._find_elements(window, info)
+                        return info
+        except:
+            pass
+        return {}
+
+    def _find_elements(self, el, info):
+        try:
+            role = el.getRoleName()
+            name = el.name or ""
+            if role in ("text", "entry", "password text") and ("address" in name.lower() or "url" in name.lower() or "search" in name.lower()):
+                text = ""
+                try:
+                    text_iface = el.queryText()
+                    text = text_iface.getText(0, min(text_iface.characterCount, 200))
+                except:
+                    pass
+                info["url_bar"] = {"name": name, "text": text}
+            if el.getState().contains(self.pyatspi.STATE_FOCUSED) and role in ("text", "entry", "password text"):
+                text = ""
+                try:
+                    text_iface = el.queryText()
+                    text = text_iface.getText(0, min(text_iface.characterCount, 200))
+                except:
+                    pass
+                info["focused_field"] = {"name": name, "text": text}
+            for i in range(el.childCount):
+                self._find_elements(el.getChildAtIndex(i), info)
+        except:
+            pass
+
+# ═══════════════════════════════════════════════════════════════════
+# OCR Tool
+# ═══════════════════════════════════════════════════════════════════
+
 class OCRTool:
     def extract_text(self):
         try:
@@ -304,40 +298,12 @@ class OCRTool:
             result = subprocess.run(["tesseract", tmp, "stdout", "--psm", "3"],
                                     capture_output=True, text=True, timeout=10)
             os.unlink(tmp)
-            return result.stdout.strip() or "(no text detected)"
-        except Exception as e:
-            return f"OCR error: {e}"
-
-class VLMTool:
-    def __init__(self, api_key):
-        self.client = Mistral(api_key=api_key)
-        self.last_call = 0
-
-    def describe(self, query):
-        now = time.time()
-        if now - self.last_call < 12:
-            time.sleep(12 - (now - self.last_call))
-        self.last_call = time.time()
-        try:
-            import mss, base64
-            with mss.MSS() as sct:
-                img = sct.grab(sct.monitors[1])
-                png = mss.tools.to_png(img.rgb, img.size)
-                b64 = base64.b64encode(png).decode()
-            resp = self.client.chat.complete(
-                model="pixtral-12b",
-                messages=[{"role":"user","content":[
-                    {"type":"text","text": f"Analyze this Linux desktop (i3 wm). {query}"},
-                    {"type":"image_url","image_url": f"data:image/png;base64,{b64}"}
-                ]}],
-                temperature=0.0, max_tokens=500
-            )
-            return resp.choices[0].message.content
-        except Exception as e:
-            return f"VLM error: {e}"
+            return result.stdout.strip() or ""
+        except Exception:
+            return ""
 
 # ═══════════════════════════════════════════════════════════════════
-# Action Executor
+# Action Executor (unchanged)
 # ═══════════════════════════════════════════════════════════════════
 
 class ActionExecutor:
@@ -356,6 +322,9 @@ class ActionExecutor:
         "ctrl+q":"29:1 16:1 16:0 29:0","alt+f4":"56:1 62:1 62:0 56:0",
         "alt+tab":"56:1 15:1 15:0 56:0","super+d":"125:1 32:1 32:0 125:0",
         "super+enter":"125:1 28:1 28:0 125:0",
+        "ctrl+shift+r": "29:1 42:1 19:1 19:0 42:0 29:0",
+        "f5": "63:1 63:0", "ctrl+f5": "29:1 63:1 63:0 29:0",
+        "/": "53:1 53:0",  # slash key
     }
     LETTER = {chr(k): v for k,v in {
         30:'a',48:'b',46:'c',32:'d',18:'e',33:'f',34:'g',35:'h',23:'i',36:'j',37:'k',38:'l',50:'m',
@@ -411,64 +380,142 @@ class ActionExecutor:
         return self.SYMBOL.get(key)
 
 # ═══════════════════════════════════════════════════════════════════
-# Tool Handler
+# Semantic Translator
 # ═══════════════════════════════════════════════════════════════════
 
-class ToolHandler:
-    def __init__(self, kb, i3, atspi, ocr, vlm):
+class SemanticTranslator:
+    def __init__(self):
+        self.executor = ActionExecutor()
+
+    def translate(self, action: SemanticAction, current_snapshot: Dict) -> List[Dict]:
+        name = action.name
+        params = action.parameters
+
+        if name == "launch_app":
+            app = params.get("app_name", "").lower()
+            open_windows = current_snapshot.get("open_windows", [])
+            existing = [w for w in open_windows if w["class"].lower() == app]
+            if existing:
+                # focus existing window
+                return [{"type": "focus_window", "class_name": app}]
+            else:
+                return [
+                    {"type": "key_combo", "keys": "super+d"},
+                    {"type": "wait", "duration": 0.3},
+                    {"type": "type_text", "text": app},
+                    {"type": "key_combo", "keys": "enter"}
+                ]
+
+        elif name == "focus_window":
+            class_name = params.get("class_name", "")
+            return [{"type": "focus_window", "class_name": class_name}]
+
+        elif name == "navigate_to":
+            url = params.get("url", "")
+            return [
+                {"type": "key_combo", "keys": "ctrl+l"},
+                {"type": "wait", "duration": 0.2},
+                {"type": "key_combo", "keys": "ctrl+a"},
+                {"type": "type_text", "text": url},
+                {"type": "key_combo", "keys": "enter"}
+            ]
+
+        elif name == "type_in_focused_field":
+            return [{"type": "type_text", "text": params.get("text", "")}]
+
+        elif name == "press_key_combo":
+            return [{"type": "key_combo", "keys": params.get("keys", "")}]
+
+        elif name == "search_youtube":
+            query = params.get("query", "")
+            return [
+                {"type": "key_combo", "keys": "/"},
+                {"type": "wait", "duration": 0.3},
+                {"type": "type_text", "text": query},
+                {"type": "wait", "duration": 1.0},
+                {"type": "key_combo", "keys": "tab"},
+                {"type": "key_combo", "keys": "enter"}
+            ]
+
+        elif name == "focus_youtube_search":
+            return [{"type": "key_combo", "keys": "/"}]
+
+        elif name == "force_reload":
+            return [{"type": "key_combo", "keys": "ctrl+shift+r"}]
+
+        elif name == "close_tab":
+            return [{"type": "key_combo", "keys": "ctrl+w"}]
+
+        elif name == "new_tab":
+            return [{"type": "key_combo", "keys": "ctrl+t"}]
+
+        elif name == "wait":
+            return [{"type": "wait", "duration": float(params.get("seconds", 1.0))}]
+
+        else:
+            print(f"⚠️ Unknown semantic action: {name}")
+            return []
+
+    def execute_low_level(self, actions: List[Dict]) -> bool:
+        for act in actions:
+            if act["type"] == "focus_window":
+                class_name = act["class_name"]
+                try:
+                    subprocess.run(["i3-msg", f'[class="{class_name}"]', "focus"], check=True)
+                    time.sleep(0.3)
+                except Exception as e:
+                    print(f"⚠️ i3-msg focus failed: {e}")
+                    return False
+            else:
+                if not self.executor.execute([act]):
+                    return False
+        return True
+
+# ═══════════════════════════════════════════════════════════════════
+# World Snapshot
+# ═══════════════════════════════════════════════════════════════════
+
+class WorldSnapshot:
+    def __init__(self, kb, i3, atspi, ocr):
         self.kb = kb
         self.i3 = i3
         self.atspi = atspi
         self.ocr = ocr
-        self.vlm = vlm
 
-    def run(self, request):
-        name = request.get("tool_name", "")
-        params = request.get("parameters", {})
-        data = ""
-        
-        if name == "input_events":
-            events = self.kb.get_recent(params.get("count", 5))
-            data = "\n".join(f"{e['keyname']} ({e['event_type']})" for e in events) or "No recent keypresses."
-        
-        elif name == "wm_events":
-            events = self.i3.get_recent_events(params.get("count", 5))
-            windows = self.i3.get_window_list()
-            focused = self.i3.get_focused()
-            lines = []
-            
-            if events:
-                lines.append("Recent window events:")
-                for e in events[-3:]:
-                    c = e["container"]
-                    lines.append(f"  [{e['event_type']}] {c.get('window_class','')}: \"{c.get('name','')}\"")
-            
-            lines.append("\nAll open windows:")
-            if windows:
-                for w in windows:
-                    mark = " ← FOCUSED" if w["focused"] else ""
-                    lines.append(f"  [{w['class']}] {w['name']}{mark}")
-            else:
-                lines.append("  (no windows open)")
-            
-            data = "\n".join(lines)
-        
-        elif name == "accessibility_tree":
-            data = self.atspi.get_tree(params.get("target","focused"), params.get("depth",2))
-        
-        elif name == "ocr_screenshot":
-            data = self.ocr.extract_text()
-        
-        elif name == "visual_screenshot":
-            data = self.vlm.describe(params.get("query","Describe the screen"))
-        
-        elif name == "get_action_history":
-            return {"tool": name, "data": "history_request", "count": params.get("count",5)}
-        
-        else:
-            data = f"Unknown tool: {name}"
-        
-        return {"tool": name, "data": data}
+    def capture(self):
+        focused = self.i3.get_focused()
+        windows = self.i3.get_window_list()
+        recent_events = self.i3.get_recent_events(3)
+        at_tree = self.atspi.get_tree("focused", 2)
+        focused_el = self.atspi.get_focused_element_info()
+        ocr_text = ""
+        if not at_tree or "error" in at_tree.lower():
+            ocr_text = self.ocr.extract_text()
+
+        return {
+            "focused_window": focused,
+            "open_windows": windows,
+            "recent_wm_events": [
+                {"type": e["event_type"], "window_class": e["container"].get("window_class", ""),
+                 "title": e["container"].get("name", "")} for e in recent_events
+            ],
+            "accessibility_tree": at_tree[:1200],
+            "focused_ui_elements": focused_el,
+            "ocr_text": ocr_text[:600],
+        }
+
+    def diff(self, before, after):
+        if before.get("focused_window") != after.get("focused_window"):
+            return True
+        bw = {w["name"] for w in before.get("open_windows", [])}
+        aw = {w["name"] for w in after.get("open_windows", [])}
+        if bw != aw:
+            return True
+        if before.get("accessibility_tree") != after.get("accessibility_tree"):
+            return True
+        if before.get("ocr_text") != after.get("ocr_text"):
+            return True
+        return False
 
 # ═══════════════════════════════════════════════════════════════════
 # LLM Client
@@ -476,445 +523,252 @@ class ToolHandler:
 
 class LLMClient:
     def __init__(self):
-        self.api_key = os.environ.get("MISTRAL_API_KEY")
-        if not self.api_key:
-            print("❌ MISTRAL_API_KEY not set!")
-            sys.exit(1)
+        self.api_key = os.environ["MISTRAL_API_KEY"]
         self.client = Mistral(api_key=self.api_key)
-        self.planner_model = os.environ.get("JARVIS_PLANNER_MODEL", "mistral-large-latest")
-        self.supervisor_model = os.environ.get("JARVIS_SUPERVISOR_MODEL", self.planner_model)
-        self.worker_model = os.environ.get("JARVIS_WORKER_MODEL", "mistral-small-latest")
-        self.min_delay = float(os.environ.get("JARVIS_LLM_DELAY", "1.5"))
-        self.last_call = 0
+        self.small = os.environ.get("JARVIS_SMALL_MODEL", "mistral-small-latest")
+        self.large = os.environ.get("JARVIS_LARGE_MODEL", "mistral-large-latest")
+        self.delay = float(os.environ.get("JARVIS_LLM_DELAY", "0.6"))
+        self.last = 0
 
     def _wait(self):
-        elapsed = time.time() - self.last_call
-        if elapsed < self.min_delay:
-            time.sleep(self.min_delay - elapsed)
-        self.last_call = time.time()
+        elapsed = time.time() - self.last
+        if elapsed < self.delay:
+            time.sleep(self.delay - elapsed)
+        self.last = time.time()
 
-    def _complete(self, model, messages, json_mode=False, max_tokens=1000):
+    def complete(self, prompt, model=None, max_tokens=500, json_mode=False):
         self._wait()
-        kwargs = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": max_tokens,
-        }
+        if model is None:
+            model = self.small
+        kwargs = {"model": model, "messages": [{"role":"user","content":prompt}],
+                  "temperature":0.0, "max_tokens":max_tokens}
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
-        return self.client.chat.complete(**kwargs).choices[0].message.content.strip()
-
-    def initial_plan(self, objective):
         try:
-            return self._complete(
-                self.planner_model,
-                [{"role":"user","content":
-                    f"Task: {objective}\n\n"
-                    "You are the planning model for a Linux i3 keyboard-only desktop agent.\n"
-                    "Create a concise 4-6 step plan. Include verification steps and avoid retrying navigation while pages load.\n"
-                    "Launch apps with Super+d, type name, Enter. Firefox navigation uses Ctrl+l, URL, Enter.\n"
-                    "Respond with numbered steps only."}],
-                max_tokens=500,
-            )
+            return self.client.chat.complete(**kwargs).choices[0].message.content.strip()
         except Exception as e:
-            print(f"⚠️ Plan error ({self.planner_model}): {e}")
-            return "1. Observe the desktop\n2. Open the needed application\n3. Navigate or enter data once\n4. Wait for loading and verify state\n5. Complete the task"
+            if "429" in str(e):
+                print("⏳ Rate limited, waiting 30s...")
+                time.sleep(30)
+            else:
+                print(f"⚠️ LLM error: {e}")
+            return ""
 
-    def ask_worker(self, system_prompt):
-        return self._ask_json(self.worker_model, system_prompt, fallback={"response_type":"question","question_text":"Repeated worker errors. Please guide me."})
+    def ask_small(self, prompt, json_mode=True, max_tokens=400):
+        return self.complete(prompt, model=self.small, json_mode=json_mode, max_tokens=max_tokens)
 
-    def ask_supervisor(self, system_prompt):
-        return self._ask_json(self.supervisor_model, system_prompt, fallback={
-            "response_type":"review",
-            "status":"intervention",
-            "summary":"Supervisor review failed.",
-            "directive":"Worker should stop repeating the last action, wait briefly, and verify with a different observation tool."
-        })
-
-    def _ask_json(self, model, system_prompt, fallback):
-        for attempt in range(2):
-            try:
-                content = self._complete(model, [{"role":"system","content": system_prompt}], json_mode=True, max_tokens=1200)
-                parsed = json.loads(content)
-                if "response_type" not in parsed:
-                    raise ValueError("Missing response_type")
-                return parsed
-            except json.JSONDecodeError:
-                print(f"⚠️ JSON error from {model}, retrying...")
-                time.sleep(1)
-            except Exception as e:
-                if "429" in str(e):
-                    print("⏳ Rate limited, waiting 30s...")
-                    time.sleep(30)
-                else:
-                    print(f"⚠️ API error from {model}: {e}")
-                    time.sleep(2)
-        return fallback.copy()
+    def ask_large(self, prompt, json_mode=True, max_tokens=600):
+        return self.complete(prompt, model=self.large, json_mode=json_mode, max_tokens=max_tokens)
 
 # ═══════════════════════════════════════════════════════════════════
-# System Prompt (stricter)
+# Goal Evaluator (large model, used only on termination)
 # ═══════════════════════════════════════════════════════════════════
 
-PROMPT = """You are JARVIS, controlling i3 on Arch Linux via keyboard injection.
+class GoalEvaluator:
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
 
-OBJECTIVE: {objective}
-PHASE: {phase} | TURN: {turn} | ACTION CYCLE: {cycle}
+    def confirm_completion(self, objective: str, snapshot: Dict) -> Tuple[bool, str]:
+        prompt = f"""Objective: {objective}
+Current desktop state:
+{json.dumps(snapshot, indent=2)}
 
-YOUR PLAN:
-{plan}
-
-RECENT ACTIONS:
-{history}
-
-LAST TOOL RESULTS:
-{tool_results}
-
-NAVIGATION/LOADING STATE:
-{navigation_state}
-
-SUPERVISOR DIRECTIVE:
-{supervisor_directive}
-
-AVAILABLE TOOLS (request using tool_request JSON):
-- wm_events(count) : Shows recent window events AND list of ALL open windows with focus.
-- input_events(count) : Shows recent keypresses.
-- accessibility_tree(target, depth) : UI elements/text inside a window. target: "focused" or class name.
-- ocr_screenshot() : Extract ALL text from screen via OCR.
-- visual_screenshot(query) : Ask VLM about screen (EXPENSIVE, last resort).
-- get_action_history(count) : Get more past actions.
-
-ACTION FORMAT (max 5 per batch):
-{{
-  "response_type": "action",
-  "actions": [
-    {{"type": "key_combo", "keys": "super+d"}},
-    {{"type": "wait", "duration": 0.3}},
-    {{"type": "type_text", "text": "firefox"}},
-    {{"type": "key_combo", "keys": "enter"}}
-  ],
-  "reasoning": "Why I'm doing this",
-  "expected_outcome": "What should happen"
-}}
-
-TOOL REQUEST FORMAT (must include tool_name and parameters):
-{{
-  "response_type": "tool_request",
-  "tool_name": "wm_events",
-  "parameters": {{"count": 5}},
-  "reasoning": "Why I need this tool"
-}}
-
-CRITICAL RULES:
-1. Launch apps: Super+d → wait 0.3s → type app name → Enter.
-2. Firefox navigation: Ctrl+l focuses address bar → type URL → Enter. Ctrl+t for new tab.
-3. ALWAYS verify with wm_events or accessibility_tree after every action batch.
-4. If wm_events already shows what you need, ACT on it. Do NOT request the same tool again.
-4a. After entering a website URL, do NOT immediately enter the same URL again. Pages can still be loading; wait or verify with accessibility_tree/OCR before retrying navigation.
-5. NEVER output a tool_request without a "tool_name" field.
-6. If stuck after 2 attempts, use question response to ask human.
-
-Respond with VALID JSON ONLY. Choose ONE: tool_request, action, question, terminate."""
+Has the objective been fully achieved? Answer with a JSON: {{"completed": true/false, "explanation": "..."}}."""
+        resp = self.llm.ask_large(prompt, json_mode=True, max_tokens=300)
+        if not resp:
+            return False, "Failed to evaluate."
+        try:
+            data = json.loads(resp)
+            return data.get("completed", False), data.get("explanation", "")
+        except:
+            return False, "Invalid evaluation response."
 
 # ═══════════════════════════════════════════════════════════════════
-# Main Agent with circuit breakers
+# Main Agent
 # ═══════════════════════════════════════════════════════════════════
 
 class Jarvis:
     def __init__(self):
-        print("🚀 Initializing JARVIS v2...")
         self.kb = KeyboardMonitor()
         self.i3 = I3Monitor()
         self.atspi = AccessibilityTree()
         self.ocr = OCRTool()
-        self.vlm = VLMTool(os.environ["MISTRAL_API_KEY"])
-        self.executor = ActionExecutor()
-        self.tools = ToolHandler(self.kb, self.i3, self.atspi, self.ocr, self.vlm)
+        self.snapshot_engine = WorldSnapshot(self.kb, self.i3, self.atspi, self.ocr)
+        self.translator = SemanticTranslator()
         self.llm = LLMClient()
-        self.supervisor_tool_limit = int(os.environ.get("JARVIS_SUPERVISOR_TOOL_LIMIT", "5"))
-        self.review_interval = int(os.environ.get("JARVIS_REVIEW_INTERVAL", "10"))
-        self.repetition_threshold = int(os.environ.get("JARVIS_REPETITION_THRESHOLD", "3"))
-        self.settle_timeout = float(os.environ.get("JARVIS_NAV_SETTLE_TIMEOUT", "6"))
-        self.settle_poll = float(os.environ.get("JARVIS_NAV_SETTLE_POLL", "0.75"))
+        self.evaluator = GoalEvaluator(self.llm)
         self.kb.start()
         self.i3.start()
         time.sleep(0.5)
-        print("✅ Ready.\n")
-
-    def reset_session(self, objective):
-        return AgentState(objective=objective)
 
     def stop(self):
         self.kb.stop()
         self.i3.stop()
 
-    def _focus_signature(self):
-        focused = self.i3.get_focused()
-        if not focused:
-            return None
-        return {"name": focused.get("name"), "class": focused.get("class")}
+    def _prompt_worker(self, objective, snap, history, extra_directive=""):
+        snap_str = json.dumps(snap, indent=2)
+        hist_str = "\n".join(
+            f"Cycle {r.cycle_number}: {r.action.name}({r.action.parameters}) success={r.success} state_changed={r.state_changed}"
+            for r in history[-6:]
+        ) or "None"
+        return f"""You are a desktop automation agent controlling i3 on Linux.
+GOAL: {objective}
 
-    def _format_history(self, state):
-        hist = ""
-        for i, a in enumerate(state.action_history[-6:]):
-            t = a.get('type','?')
-            r = a.get('reasoning','')[:100]
-            if t == 'action':
-                acts = a.get('actions',[])
-                desc = ', '.join(f"{x.get('type')}:{x.get('keys', x.get('text', x.get('duration','')))}" for x in acts[:3])
-                hist += f"{i+1}. ACTION: {desc}\n   → {r}\n"
-            elif t == 'tool_request':
-                hist += f"{i+1}. TOOL: {a.get('tool_name','?')} - {r}\n"
-            elif t == 'supervisor_review':
-                hist += f"{i+1}. SUPERVISOR: {a.get('status')} - {a.get('directive','')[:100]}\n"
-            elif t == 'question':
-                hist += f"{i+1}. ASKED: {a.get('text','')[:80]}\n"
-            elif t == 'human_response':
-                hist += f"{i+1}. HUMAN: {a.get('text','')[:80]}\n"
-        return hist or "None yet"
+CURRENT DESKTOP STATE:
+{snap_str}
 
-    def _format_tools(self, state):
-        return "".join(f"[{r.get('tool','?')}]:\n{str(r.get('data',''))[:600]}\n\n" for r in state.tool_results) or "None yet. Request a tool to gather info."
+RECENT ACTIONS:
+{hist_str}
 
-    def _nav_state_text(self, state):
-        nav = state.navigation
-        if not nav.pending and not nav.message:
-            return "No pending navigation."
-        return f"status={nav.status}; target={nav.target}; message={nav.message}"
+{extra_directive}
 
-    def _worker_prompt(self, state):
-        return PROMPT.format(
-            objective=state.objective,
-            phase=state.task_phase,
-            turn=state.turn_count,
-            cycle=state.cycle_count,
-            plan=state.initial_reasoning,
-            history=self._format_history(state),
-            tool_results=self._format_tools(state),
-            navigation_state=self._nav_state_text(state),
-            supervisor_directive=state.latest_supervisor_directive or state.supervisor_warning or "None",
-        )
+POWER-USER KEYBOARD TIPS:
+- Use '/' on YouTube to focus the search box.
+- Use Ctrl+L for address bar, Ctrl+T for new tab.
+- If an app is already open, use focus_window (class name) instead of launch_app.
+- You can use press_key_combo with any i3 key combination (e.g., 'super+2' to switch to workspace 2).
+- Use Ctrl+F to search for text on a webpage.
 
-    def _settle_navigation(self, state, actions, fingerprint):
-        is_nav, target = is_navigation_batch(actions)
-        if not is_nav:
-            state.navigation.pending = False
-            return None
-        if state.navigation.fingerprint == fingerprint and time.time() - state.navigation.completed_at < self.settle_timeout:
-            state.navigation.message = "Duplicate navigation suppressed: verify loading instead of re-entering the URL."
-            return {"tool":"navigation_settle", "data": state.navigation.message}
-        state.navigation = NavigationSettleState(True, target, fingerprint, time.time(), 0.0, "loading", f"Waiting for {target} to settle")
-        before = self._focus_signature()
-        deadline = time.time() + self.settle_timeout
-        last = before
-        stable_seen = 0
-        while time.time() < deadline:
-            time.sleep(self.settle_poll)
-            current = self._focus_signature()
-            if current and current == last:
-                stable_seen += 1
-                if stable_seen >= 2:
-                    break
-            else:
-                stable_seen = 0
-                last = current
-        state.navigation.pending = False
-        state.navigation.completed_at = time.time()
-        state.navigation.status = "settled" if stable_seen >= 2 else "timeout"
-        state.navigation.message = f"Navigation to {target} {state.navigation.status}; verify page before retrying URL entry."
-        return {"tool":"navigation_settle", "data": state.navigation.message, "before": before, "after": last}
+AVAILABLE SEMANTIC ACTIONS (output JSON with 'action', 'parameters', 'reasoning'):
+- launch_app: {{"app_name": "firefox"}}
+- focus_window: {{"class_name": "firefox"}}
+- navigate_to: {{"url": "https://..."}}
+- type_in_focused_field: {{"text": "..."}}
+- press_key_combo: {{"keys": "ctrl+t"}}
+- search_youtube: {{"query": "..."}}   (uses '/' to focus, type, Tab, Enter)
+- focus_youtube_search: (just press '/')
+- force_reload: ()
+- close_tab: ()
+- new_tab: ()
+- wait: {{"seconds": 2.0}}
+- terminate: ()   (if you believe the goal is fully achieved)
 
-    def _record_cycle(self, state, actions, reasoning, expected, success, pre_focus, settle_result):
-        post_focus = self._focus_signature()
-        fingerprint = normalize_actions(actions)
-        state.cycle_count += 1
-        changed = pre_focus != post_focus or bool(settle_result and settle_result.get("before") != settle_result.get("after"))
-        if fingerprint == state.last_action_fingerprint and not changed:
-            state.repeated_action_count += 1
-        else:
-            state.repeated_action_count = 1
-        state.last_action_fingerprint = fingerprint
-        tools = list(state.tool_results)
-        if settle_result:
-            tools.append(settle_result)
-            state.tool_results = [settle_result]
-        rec = CycleRecord(state.cycle_count, actions, fingerprint, reasoning, expected, "success" if success else "failed", pre_focus, post_focus, changed, tools)
-        state.cycle_history.append(rec)
-        return rec
+Choose ONE action that makes progress. Explain your reasoning briefly."""
 
-    def _supervisor_prompt(self, state, reason, records, observations):
-        payload = [{
-            "cycle": r.cycle_number,
-            "fingerprint": r.fingerprint,
-            "actions": r.actions,
-            "result": r.result,
-            "state_changed": r.state_changed,
-            "pre_focus": r.pre_focus,
-            "post_focus": r.post_focus,
-            "reasoning": r.reasoning,
-            "tools": r.tool_results[-2:],
-        } for r in records]
-        return ("You are the large-model supervisor for a keyboard-only Linux desktop agent. "
-                "Review progress, detect loops, and provide concise guidance. You may request observation tools only.\n"
-                f"Objective: {state.objective}\nReason for review: {reason}\nPlan:\n{state.initial_reasoning}\n"
-                f"Navigation state: {self._nav_state_text(state)}\nCycle records JSON:\n{json.dumps(payload, default=str)[:6000]}\n"
-                f"Extra observations JSON:\n{json.dumps(observations, default=str)[:3000]}\n"
-                "Respond as JSON. Either request one tool with response_type=tool_request, tool_name, parameters, reasoning, "
-                "or finish with {\"response_type\":\"review\",\"status\":\"ok|intervention\",\"summary\":\"...\",\"directive\":\"clear instruction for worker\"}.")
+    def _guard_rails(self, action: SemanticAction, history: List[CycleRecord]) -> Tuple[bool, str]:
+        if len(history) < 3:
+            return False, ""
+        last_three = history[-3:]
+        if all(r.action.name == action.name and r.action.parameters == action.parameters for r in last_three):
+            if not any(r.state_changed for r in last_three):
+                return True, "Same action repeated 3 times with no state change."
+        return False, ""
 
-    def _run_supervisor_review(self, state, reason):
-        records = state.cycle_history[-10:]
-        observations = []
-        for _ in range(self.supervisor_tool_limit + 1):
-            resp = self.llm.ask_supervisor(self._supervisor_prompt(state, reason, records, observations))
-            if resp.get("response_type") == "tool_request" and len(observations) < self.supervisor_tool_limit:
-                name = resp.get("tool_name") or "wm_events"
-                if name == "get_action_history":
-                    data = json.dumps([r.__dict__ for r in records], default=str)
-                    observations.append({"tool":"action_history", "data": data})
-                else:
-                    resp["tool_name"] = name
-                    observations.append(self.tools.run(resp))
-                continue
-            if resp.get("response_type") == "review":
-                state.latest_supervisor_directive = resp.get("directive", "")
-                state.last_review_cycle = state.cycle_count
-                state.action_history.append({"type":"supervisor_review", "status":resp.get("status"), "reason":reason, "summary":resp.get("summary",""), "directive":state.latest_supervisor_directive})
-                if state.cycle_history:
-                    state.cycle_history[-1].supervisor_directive = state.latest_supervisor_directive
-                print(f"🧭 Supervisor {resp.get('status')}: {resp.get('summary','')[:160]}")
-                if state.latest_supervisor_directive:
-                    print(f"   Directive: {state.latest_supervisor_directive[:220]}")
-                return resp
-            break
-        warning = "Supervisor could not complete review; worker must avoid repeating the last action and verify with a different observation."
-        state.supervisor_warning = warning
-        state.latest_supervisor_directive = warning
-        return {"response_type":"review", "status":"intervention", "summary":"Supervisor unavailable", "directive":warning}
+    def _supervisor_intervention(self, objective, snap, history):
+        prompt = f"""You are a supervisor agent. The small worker is stuck on: {objective}
+Current state:
+{json.dumps(snap, indent=2)}
 
-    def _has_repeated_short_pattern(self, state):
-        if len(state.cycle_history) < 4:
-            return False
-        recent = state.cycle_history[-4:]
-        fingerprints = [r.fingerprint for r in recent]
-        no_progress = not any(r.state_changed for r in recent)
-        return no_progress and fingerprints[:2] == fingerprints[2:]
+History:
+{json.dumps([{"cycle": r.cycle_number, "action": r.action.name, "params": r.action.parameters, "changed": r.state_changed} for r in history[-6:]], indent=2)}
 
-    def _maybe_review(self, state):
-        if state.cycle_count and state.repeated_action_count >= self.repetition_threshold and state.last_review_cycle != state.cycle_count:
-            return self._run_supervisor_review(state, "three repeated action cycles without meaningful progress")
-        if state.cycle_count and self._has_repeated_short_pattern(state) and state.last_review_cycle != state.cycle_count:
-            return self._run_supervisor_review(state, "repeated short action pattern without meaningful progress")
-        if state.cycle_count and state.cycle_count % self.review_interval == 0 and state.last_review_cycle != state.cycle_count:
-            return self._run_supervisor_review(state, f"periodic {self.review_interval}-cycle checkpoint")
-        return None
+Propose ONE semantic action to break the deadlock. Use the same action names as the worker.
+Output JSON: {{"action": "...", "parameters": {{...}}, "reasoning": "..."}}"""
+        resp = self.llm.ask_large(prompt, json_mode=True, max_tokens=400)
+        if not resp:
+            return SemanticAction("press_key_combo", {"keys": "esc"}, "fallback")
+        try:
+            data = json.loads(resp)
+            return SemanticAction(data["action"], data.get("parameters", {}), data["reasoning"])
+        except:
+            return SemanticAction("force_reload", {}, "fallback")
 
     def run(self, objective):
-        state = self.reset_session(objective)
-        state.initial_reasoning = self.llm.initial_plan(objective)
-        print(f"📝 Plan:\n{state.initial_reasoning}\n{'─'*50}\n")
+        history: List[CycleRecord] = []
+        snap = self.snapshot_engine.capture()
+        cycle = 0
+
         while True:
-            state.turn_count += 1
-            resp = self.llm.ask_worker(self._worker_prompt(state))
-            rtype = resp.get("response_type", "")
-            if not rtype:
-                state.consecutive_malformed += 1
-                if state.consecutive_malformed >= 3:
-                    resp = {"response_type":"question","question_text":"The worker returned malformed responses repeatedly. What should I do next?"}
-                    rtype = "question"
-                else:
-                    print("⚠️ Malformed response (missing response_type). Skipping turn.")
-                    continue
-            if rtype == "tool_request":
-                name = resp.get("tool_name") or "wm_events"
-                resp["tool_name"] = name
-                if name == state.last_tool_name:
-                    state.consecutive_same_tool += 1
-                else:
-                    state.consecutive_same_tool = 1
-                state.last_tool_name = name
-                if state.consecutive_same_tool >= 3:
-                    state.latest_supervisor_directive = f"You requested {name} repeatedly. Use a different observation or take the next safe action."
-                    state.consecutive_same_tool = 0
-                print(f"🔧 Turn {state.turn_count}: {name}")
-                if name == "get_action_history":
-                    count = min(resp.get("parameters",{}).get("count",5), 10)
-                    formatted = json.dumps([r.__dict__ for r in state.cycle_history[-count:]], default=str)
-                    state.tool_results = [{"tool":"action_history","data":formatted}]
-                else:
-                    result = self.tools.run(resp)
-                    state.tool_results = [result]
-                    print(f"   Result: {str(result.get('data',''))[:250]}")
-                state.action_history.append({"type":"tool_request", "tool_name":name, "reasoning":resp.get("reasoning","")})
-                state.consecutive_malformed = 0
+            cycle += 1
+            print(f"\n🔄 Cycle {cycle}")
+
+            directive = ""
+            if history and not history[-1].state_changed:
+                directive = "Note: last action did not change the state. Consider a different approach."
+
+            worker_prompt = self._prompt_worker(objective, snap, history, directive)
+            resp = self.llm.ask_small(worker_prompt, json_mode=True, max_tokens=400)
+            if not resp:
+                print("❌ No response from worker. Retrying...")
                 continue
-            if rtype == "action":
-                actions = resp.get("actions", [])[:5]
-                if not actions:
-                    print("⚠️ Action response with no actions")
-                    continue
-                fingerprint = normalize_actions(actions)
-                nav, target = is_navigation_batch(actions)
-                if nav and state.navigation.fingerprint == fingerprint and time.time() - state.navigation.completed_at < self.settle_timeout:
-                    msg = "Blocked immediate duplicate navigation; wait/observe because the page may still be loading."
-                    state.tool_results = [{"tool":"navigation_guard", "data":msg}]
-                    state.latest_supervisor_directive = msg
-                    print(f"🛑 {msg}")
-                    continue
-                reasoning = resp.get("reasoning", "")
-                expected = resp.get("expected_outcome", "")
-                print(f"\n⚡ Cycle {state.cycle_count + 1}: Executing {len(actions)} action(s)")
-                pre_focus = self._focus_signature()
-                success = self.executor.execute(actions)
-                settle = self._settle_navigation(state, actions, fingerprint)
-                state.action_history.append({"type":"action", "actions":actions, "reasoning":reasoning, "expected_outcome":expected, "result":"success" if success else "failed"})
-                self._record_cycle(state, actions, reasoning, expected, success, pre_focus, settle)
-                state.task_phase = "verifying"
-                state.consecutive_same_tool = 0
-                state.consecutive_malformed = 0
-                state.consecutive_failures = 0 if success else state.consecutive_failures + 1
-                self._maybe_review(state)
+            try:
+                data = json.loads(resp)
+                action = SemanticAction(data["action"], data.get("parameters", {}), data.get("reasoning", ""))
+            except:
+                print(f"⚠️ Invalid worker JSON: {resp[:150]}")
                 continue
-            if rtype == "question":
-                qtext = resp.get("question_text", "I need help.")
-                print(f"\n{'='*50}\n\a\a\a\n🔔 AGENT NEEDS HELP\n{'='*50}\n\n❓ {qtext}")
-                ans = input("\n👉 Your response (or 'exit'): ")
-                if ans.lower() == 'exit':
-                    print("🛑 Terminated by user.")
-                    return "user_exit"
-                state.action_history.append({"type":"question","text":qtext})
-                state.action_history.append({"type":"human_response","text":ans})
+
+            print(f"💡 Worker: {action.name}({action.parameters}) | {action.reasoning[:120]}")
+
+            if action.name == "terminate":
+                confirmed, reason = self.evaluator.confirm_completion(objective, snap)
+                if confirmed:
+                    print(f"✅ Goal achieved: {reason}")
+                    return "completed"
+                else:
+                    print(f"❌ Not yet. Reason: {reason}")
+                    directive = f"Goal not yet achieved: {reason}. Please continue."
+                    continue
+
+            blocked, msg = self._guard_rails(action, history)
+            if blocked:
+                print(f"🚫 Blocked: {msg}")
+                action = self._supervisor_intervention(objective, snap, history)
+                print(f"↩️ Supervisor: {action.name}({action.parameters})")
+
+            low_level = self.translator.translate(action, snap)
+            if not low_level:
+                print("⚠️ No low-level actions.")
                 continue
-            if rtype == "terminate":
-                status = resp.get("task_status", "completed")
-                summary = resp.get("summary", "Task finished.")
-                print(f"\n{'='*50}\n{'✅' if status=='completed' else '❌'} MISSION {status.upper()}\n{'='*50}\n\n{summary}")
-                print(f"\n📊 {state.turn_count} turns, {state.cycle_count} action cycles")
-                return status
-            state.consecutive_malformed += 1
-            print(f"⚠️ Unknown response_type '{rtype}'. Will retry.")
+
+            print(f"⌨️ Executing {len(low_level)} step(s)...")
+            success = self.translator.execute_low_level(low_level)
+            time.sleep(0.5)
+
+            new_snap = self.snapshot_engine.capture()
+            changed = self.snapshot_engine.diff(snap, new_snap)
+
+            record = CycleRecord(cycle, snap, action, success, new_snap, changed)
+            history.append(record)
+            snap = new_snap
+
+            if len(history) >= 3 and not any(r.state_changed for r in history[-3:]):
+                print("🧠 No progress for 3 cycles, calling supervisor...")
+                sup_action = self._supervisor_intervention(objective, snap, history)
+                print(f"↩️ Supervisor: {sup_action.name}({sup_action.parameters})")
+                sup_low = self.translator.translate(sup_action, snap)
+                if sup_low:
+                    self.translator.execute_low_level(sup_low)
+                    time.sleep(0.5)
+                    sup_snap = self.snapshot_engine.capture()
+                    sup_changed = self.snapshot_engine.diff(snap, sup_snap)
+                    history.append(CycleRecord(cycle + 0.5, snap, sup_action, True, sup_snap, sup_changed))
+                    snap = sup_snap
+                    continue
+
+            if cycle % 25 == 0:
+                a = input("\n🤔 Still working. Continue? (y/n): ")
+                if a.lower() != 'y':
+                    return "interrupted"
+
+# ═══════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     jarvis = Jarvis()
     try:
-        if len(sys.argv) > 1:
-            obj = " ".join(sys.argv[1:]).strip()
+        print("🚀 JARVIS v3.1 – Workspace-aware & Power-User Ready.")
+        print("Press Ctrl+C to exit.\n")
+        while True:
+            obj = input("What should JARVIS do?\n👉 ").strip()
             if not obj:
-                print("❌ No objective provided.")
-                sys.exit(1)
-            jarvis.run(obj)
-        else:
-            print("\n🤖 JARVIS v2 - Autonomous Desktop Agent")
-            print("Press Ctrl+C to exit. Completed missions return here.\n")
-            while True:
-                obj = input("What should JARVIS do?\n👉 ").strip()
-                if not obj:
-                    print("❌ No objective provided.")
-                    continue
-                jarvis.run(obj)
-                print("\n↩️ Ready for the next objective.\n")
+                print("❌ Empty objective.")
+                continue
+            result = jarvis.run(obj)
+            print(f"\n↩️ Mission: {result}. Ready for next.\n")
     except KeyboardInterrupt:
-        print("\n🛑 Ctrl+C received. Shutting down monitors.")
+        print("\n🛑 Shutting down.")
     finally:
         jarvis.stop()
         print("👋 JARVIS shutdown complete.")
